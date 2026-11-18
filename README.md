@@ -33,8 +33,10 @@ Install MetaMask and connect it to Sepolia. Minting, listing, price updates, lis
 ```bash
 npm run compile
 npm test
-npx hardhat run scripts/deploy.cjs --network sepolia
+npm run deploy:sepolia
 ```
+
+The Hardhat suite currently has seven passing tests covering minting and royalties, buyer ownership transfer, supply-chain update permissions, listing price changes/cancellation, invalid marketplace actions, purchase payment splits, marketplace fee limits, and invalid mint inputs. Run it locally; tests do not deploy to Sepolia or use real funds.
 
 ## Database
 
