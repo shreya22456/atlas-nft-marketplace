@@ -2,6 +2,8 @@
 
 A React NFT marketplace, MetaMask wallet integration, Supabase API/database, and Solidity supply-chain demo for the Sepolia testnet.
 
+For the full architecture, setup, API, database, contract, testing, and deployment guide, see [Atlas NFT Marketplace Project Documentation](./Atlas_NFT_Marketplace_Project_Documentation.docx).
+
 ## Features
 
 - MetaMask connection, account updates, and Sepolia network switching
