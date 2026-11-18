@@ -26,6 +26,8 @@ The frontend runs at `http://localhost:5173` and the API at `http://localhost:30
 3. Set both `VITE_*_CONTRACT_ADDRESS` values in `.env.local`, and the non-prefixed contract address variables plus `SEPOLIA_RPC_URL` on the API host.
 4. Restart the dev server after changing environment variables.
 
+The marketplace listing storage layout changed for gas savings. Deploy a fresh marketplace contract after this update and replace the old marketplace address; this contract is not upgradeable.
+
 Install MetaMask and connect it to Sepolia. Minting, listing, price updates, listing cancellation, product journey updates, and purchases require deployed contract addresses and Sepolia test ETH. The API checks confirmed Sepolia receipts and contract events before syncing them into SQLite. `GET /api/network` reports RPC and deployment status. Set `PINATA_JWT` in `.env.local` to pin uploaded images and metadata to IPFS; without it, metadata is served from the local API.
 
 ## Compile, test, and deploy
@@ -36,7 +38,7 @@ npm test
 npm run deploy:sepolia
 ```
 
-The Hardhat suite currently has seven passing tests covering minting and royalties, buyer ownership transfer, supply-chain update permissions, listing price changes/cancellation, invalid marketplace actions, purchase payment splits, marketplace fee limits, and invalid mint inputs. Run it locally; tests do not deploy to Sepolia or use real funds.
+The Hardhat suite currently has ten tests covering minting and royalties, buyer ownership transfer, supply-chain update permissions, listing price changes/cancellation, invalid marketplace actions, purchase payment splits, marketplace fee limits, invalid mint inputs, zero-address royalty edge cases, no-royalty collections, and gas budgets. The Solidity optimizer is enabled with 200 runs. In a local Hardhat measurement, listing used 81,166 gas (previous baseline 106,293) and purchasing used 103,089 gas (previous baseline 106,549); actual Sepolia gas varies with network state. Run tests locally; they do not deploy to Sepolia or use real funds.
 
 ## Database
 

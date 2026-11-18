@@ -7,8 +7,8 @@ import "@openzeppelin/contracts/token/common/ERC2981.sol";
 
 contract AtlasMarketplace is ReentrancyGuard {
     struct Listing {
-        address seller;
         uint256 price;
+        address seller;
         bool active;
     }
 
@@ -27,12 +27,12 @@ contract AtlasMarketplace is ReentrancyGuard {
         require(price > 0, "Price must exceed zero");
         require(IERC721(nft).ownerOf(tokenId) == msg.sender, "Not token owner");
         require(IERC721(nft).isApprovedForAll(msg.sender, address(this)) || IERC721(nft).getApproved(tokenId) == address(this), "Marketplace not approved");
-        listings[nft][tokenId] = Listing(msg.sender, price, true);
+        listings[nft][tokenId] = Listing(price, msg.sender, true);
         emit Listed(nft, tokenId, msg.sender, price);
     }
 
     function cancelListing(address nft, uint256 tokenId) external {
-        Listing memory listing = listings[nft][tokenId];
+        Listing storage listing = listings[nft][tokenId];
         require(listing.active && listing.seller == msg.sender, "No active listing");
         listings[nft][tokenId].active = false;
         emit ListingCancelled(nft, tokenId);
@@ -47,21 +47,26 @@ contract AtlasMarketplace is ReentrancyGuard {
     }
 
     function buy(address nft, uint256 tokenId) external payable nonReentrant {
-        Listing memory listing = listings[nft][tokenId];
+        Listing storage listing = listings[nft][tokenId];
         require(listing.active, "Listing not active");
         require(msg.value == listing.price, "Incorrect ETH amount");
-        listings[nft][tokenId].active = false;
+        address seller = listing.seller;
+        listing.active = false;
 
         uint256 fee = (msg.value * marketplaceFeeBps) / 10000;
         uint256 royalty;
         address royaltyReceiver;
-        try IERC165(nft).supportsInterface(type(IERC2981).interfaceId) returns (bool supported) {
-            if (supported) (royaltyReceiver, royalty) = IERC2981(nft).royaltyInfo(tokenId, msg.value);
-        } catch {}
+        try IERC2981(nft).royaltyInfo(tokenId, msg.value) returns (address receiver, uint256 amount) {
+            royaltyReceiver = receiver;
+            royalty = amount;
+        } catch {
+            royalty = 0;
+        }
+        require(royalty == 0 || royaltyReceiver != address(0), "Invalid royalty receiver");
         if (royalty > msg.value) royalty = msg.value;
         require(royalty + fee <= msg.value, "Fees exceed price");
 
-        IERC721(nft).safeTransferFrom(listing.seller, msg.sender, tokenId);
+        IERC721(nft).safeTransferFrom(seller, msg.sender, tokenId);
         if (royaltyReceiver != address(0) && royalty > 0) {
             (bool paidRoyalty,) = payable(royaltyReceiver).call{value: royalty}("");
             require(paidRoyalty, "Royalty payment failed");
@@ -70,9 +75,9 @@ contract AtlasMarketplace is ReentrancyGuard {
             (bool paidFee,) = payable(owner).call{value: fee}("");
             require(paidFee, "Fee payment failed");
         }
-        (bool paidSeller,) = payable(listing.seller).call{value: msg.value - royalty - fee}("");
+        (bool paidSeller,) = payable(seller).call{value: msg.value - royalty - fee}("");
         require(paidSeller, "Seller payment failed");
-        emit Purchased(nft, tokenId, msg.sender, listing.seller, msg.value);
+        emit Purchased(nft, tokenId, msg.sender, seller, msg.value);
     }
 
     function setMarketplaceFee(uint256 feeBps) external {

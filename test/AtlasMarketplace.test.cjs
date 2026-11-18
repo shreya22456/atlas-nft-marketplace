@@ -138,4 +138,59 @@ describe("Atlas marketplace", function () {
     await expect(nft.connect(creator).mint(creator.address, "ipfs://asset", "Berlin", 1001))
       .to.be.revertedWith("Royalty exceeds 10%");
   });
+
+  it("rejects a positive royalty with a zero receiver without selling the NFT", async function () {
+    const [seller, buyer] = await ethers.getSigners();
+    const NFT = await ethers.getContractFactory("MockZeroReceiverRoyaltyNFT");
+    const nft = await NFT.deploy(seller.address);
+    await nft.waitForDeployment();
+    const Marketplace = await ethers.getContractFactory("AtlasMarketplace");
+    const marketplace = await Marketplace.deploy();
+    await marketplace.waitForDeployment();
+
+    await nft.connect(seller).approve(await marketplace.getAddress(), 1);
+    await marketplace.connect(seller).list(await nft.getAddress(), 1, ethers.parseEther("1"));
+    await expect(marketplace.connect(buyer).buy(await nft.getAddress(), 1, { value: ethers.parseEther("1") }))
+      .to.be.revertedWith("Invalid royalty receiver");
+
+    expect(await nft.ownerOf(1)).to.equal(seller.address);
+    const listing = await marketplace.listings(await nft.getAddress(), 1);
+    expect(listing.active).to.equal(true);
+  });
+
+  it("sells ERC-721 collections without ERC-2981 royalties", async function () {
+    const [seller, buyer] = await ethers.getSigners();
+    const NFT = await ethers.getContractFactory("MockPlainNFT");
+    const nft = await NFT.deploy(seller.address);
+    await nft.waitForDeployment();
+    const Marketplace = await ethers.getContractFactory("AtlasMarketplace");
+    const marketplace = await Marketplace.deploy();
+    await marketplace.waitForDeployment();
+
+    await nft.connect(seller).approve(await marketplace.getAddress(), 1);
+    await marketplace.connect(seller).list(await nft.getAddress(), 1, ethers.parseEther("1"));
+    await marketplace.connect(buyer).buy(await nft.getAddress(), 1, { value: ethers.parseEther("1") });
+
+    expect(await nft.ownerOf(1)).to.equal(buyer.address);
+  });
+
+  it("keeps optimized list and buy transactions within gas budgets", async function () {
+    const [owner, seller, buyer] = await ethers.getSigners();
+    const NFT = await ethers.getContractFactory("AtlasNFT");
+    const nft = await NFT.deploy(owner.address);
+    await nft.waitForDeployment();
+    const Marketplace = await ethers.getContractFactory("AtlasMarketplace");
+    const marketplace = await Marketplace.deploy();
+    await marketplace.waitForDeployment();
+
+    await nft.connect(seller).mint(seller.address, "ipfs://gas", "Berlin", 500);
+    await nft.connect(seller).approve(await marketplace.getAddress(), 1);
+    const listingTx = await marketplace.connect(seller).list(await nft.getAddress(), 1, ethers.parseEther("1"));
+    const listingReceipt = await listingTx.wait();
+    expect(listingReceipt.gasUsed).to.be.lessThan(90000n);
+
+    const purchaseTx = await marketplace.connect(buyer).buy(await nft.getAddress(), 1, { value: ethers.parseEther("1") });
+    const purchaseReceipt = await purchaseTx.wait();
+    expect(purchaseReceipt.gasUsed).to.be.lessThan(110000n);
+  });
 });

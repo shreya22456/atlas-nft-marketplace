@@ -8,7 +8,7 @@ export const NFT_ABI = [
 ]
 
 export const MARKETPLACE_ABI = [
-  'function listings(address nft, uint256 tokenId) view returns (address seller, uint256 price, bool active)',
+  'function listings(address nft, uint256 tokenId) view returns (uint256 price, address seller, bool active)',
   'function list(address nft, uint256 tokenId, uint256 price)',
   'function cancelListing(address nft, uint256 tokenId)',
   'function updatePrice(address nft, uint256 tokenId, uint256 price)',
