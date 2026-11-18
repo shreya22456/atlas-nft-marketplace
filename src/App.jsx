@@ -490,7 +490,7 @@ function MintModal({ onClose, onMint, busy }) {
     <label>Description<textarea name="description" value={values.description} onChange={change} maxLength="2000" placeholder="Describe the physical asset" /></label>
     <div className="modal-row"><label>Product category<input name="category" value={values.category} onChange={change} maxLength="60" required placeholder="Collectible" /></label><label>Royalty %<input type="number" min="0" max="10" step="0.1" value={values.royaltyBps / 100} onChange={(event) => setValues((current) => ({ ...current, royaltyBps: Math.round(Number(event.target.value) * 100) }))} /></label></div>
     <label>Manufacturing origin<input name="origin" value={values.origin} onChange={change} maxLength="120" placeholder="Berlin, Germany" /></label>
-    <p className="storage-note">Metadata is saved in the local SQLite database. Configure Pinata to publish it to IPFS.</p>
+    <p className="storage-note">Metadata is saved in Supabase. Configure Pinata to publish it to IPFS.</p>
     <button className="mint-submit" type="submit" disabled={busy || !values.image}>{busy ? 'Waiting for transaction…' : 'Mint on Sepolia'}</button>
   </form></div>
 }

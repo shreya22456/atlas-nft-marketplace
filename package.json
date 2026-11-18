@@ -15,6 +15,7 @@
     "deploy:sepolia": "hardhat run scripts/deploy.cjs --network sepolia"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.119.0",
     "ethers": "^6.15.0",
     "express": "^5.1.0",
     "react": "^19.3.1",

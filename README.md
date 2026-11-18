@@ -1,13 +1,13 @@
 # Atlas NFT Marketplace
 
-A React NFT marketplace, MetaMask wallet integration, SQLite API, and Solidity supply-chain demo for the Sepolia testnet.
+A React NFT marketplace, MetaMask wallet integration, Supabase API/database, and Solidity supply-chain demo for the Sepolia testnet.
 
 ## Features
 
 - MetaMask connection, account updates, and Sepolia network switching
 - ERC-721 minting, marketplace listings, and purchases through wallet-confirmed transactions
 - ERC-2981 creator royalties and ReentrancyGuard-protected purchases
-- SQLite asset metadata and confirmed transaction history
+- Supabase asset metadata and confirmed transaction history
 - Responsive marketplace, collection, and asset detail views
 
 ## Run the app
@@ -17,7 +17,7 @@ npm install
 npm run dev
 ```
 
-The frontend runs at `http://localhost:5173` and the API at `http://localhost:3001`. Node.js 22.13+ is required for the built-in SQLite driver. The local database is created at `data/atlas.sqlite`. Seed listings are previews and cannot be purchased.
+The frontend runs at `http://localhost:5173` and the API at `http://localhost:3001`. Node.js 22.13+ is required. Create a Supabase project, run `supabase/schema.sql` in its SQL Editor, and add `SUPABASE_URL` plus the server-only `SUPABASE_SERVICE_ROLE_KEY` to `.env.local`. Seed listings are previews and cannot be purchased.
 
 ## Configure MetaMask and Sepolia
 
@@ -28,7 +28,7 @@ The frontend runs at `http://localhost:5173` and the API at `http://localhost:30
 
 The marketplace listing storage layout changed for gas savings. Deploy a fresh marketplace contract after this update and replace the old marketplace address; this contract is not upgradeable.
 
-Install MetaMask and connect it to Sepolia. Minting, listing, price updates, listing cancellation, product journey updates, and purchases require deployed contract addresses and Sepolia test ETH. The API checks confirmed Sepolia receipts and contract events before syncing them into SQLite. `GET /api/network` reports RPC and deployment status. Set `PINATA_JWT` in `.env.local` to pin uploaded images and metadata to IPFS; without it, metadata is served from the local API.
+Install MetaMask and connect it to Sepolia. Minting, listing, price updates, listing cancellation, product journey updates, and purchases require deployed contract addresses and Sepolia test ETH. The API checks confirmed Sepolia receipts and contract events before syncing them into Supabase. `GET /api/network` reports RPC and deployment status. Set `PINATA_JWT` in `.env.local` to pin uploaded images and metadata to IPFS; without it, metadata is served from the API.
 
 ## Compile, test, and deploy
 
@@ -42,14 +42,14 @@ The Hardhat suite currently has ten tests covering minting and royalties, buyer 
 
 ## Database
 
-The API persists assets and confirmed mint/list/purchase transactions in SQLite. Set `DATABASE_PATH` to change the database location. Contract transactions are the source of truth; SQLite is the local metadata store and index.
+The API persists assets and confirmed mint/list/purchase transactions in Supabase. Contract transactions are the source of truth; Supabase is the metadata store and index. Never expose the Supabase service-role key in a `VITE_*` variable or commit it to source control.
 
-## Publish (Vercel + Render)
+## Publish (Vercel + Supabase)
 
 1. Push this repository to GitHub.
-2. On Render, create a Blueprint from the repository and apply `render.yaml`. The attached persistent disk is required for SQLite and uses Render's paid Starter plan.
-3. Set Render's `PUBLIC_API_URL` to the Render service URL, `CORS_ORIGIN` to the Vercel site URL, and optionally set `PINATA_JWT`.
-4. On Vercel, import the same GitHub repository and set `VITE_API_URL` to the Render service URL. Set the two `VITE_*_CONTRACT_ADDRESS` variables after deploying contracts.
-5. Redeploy both services after setting environment variables.
+2. Create a Supabase project and run `supabase/schema.sql` in the SQL Editor.
+3. In Vercel Project Settings → Environment Variables, set `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` (server-only), plus `SEPOLIA_RPC_URL`, `NFT_CONTRACT_ADDRESS`, and `MARKETPLACE_CONTRACT_ADDRESS` for the API.
+4. Set `VITE_NFT_CONTRACT_ADDRESS` and `VITE_MARKETPLACE_CONTRACT_ADDRESS` for the frontend after deploying contracts. Leave `VITE_API_URL` empty so the frontend uses the same Vercel domain.
+5. Redeploy on Vercel after setting environment variables. Optionally add `PINATA_JWT` and `PUBLIC_API_URL` (the production Vercel URL).
 
-Do not commit `.env`/`.env.local`, private keys, or the SQLite database. `.env.example` contains placeholders only.
+Do not commit `.env`/`.env.local`, private keys, or the Supabase service-role key. `.env.example` contains placeholders only.

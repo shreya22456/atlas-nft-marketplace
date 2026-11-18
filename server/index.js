@@ -1,16 +1,20 @@
 import dotenv from 'dotenv'
 import express from 'express'
-import { DatabaseSync } from 'node:sqlite'
-import { mkdirSync } from 'node:fs'
-import { dirname, resolve } from 'node:path'
 import { Contract, Interface, JsonRpcProvider, getAddress } from 'ethers'
+import { createClient } from '@supabase/supabase-js'
 
 dotenv.config({ path: '.env' })
 dotenv.config({ path: '.env.local' })
 
 const app = express()
 const port = Number(process.env.PORT || process.env.API_PORT || 3001)
-const databasePath = resolve(process.env.DATABASE_PATH || 'data/atlas.sqlite')
+const supabaseUrl = process.env.SUPABASE_URL
+const supabaseServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY
+const supabase = supabaseUrl && supabaseServiceRoleKey
+  ? createClient(supabaseUrl, supabaseServiceRoleKey, {
+    auth: { autoRefreshToken: false, persistSession: false },
+  })
+  : null
 const nftInterface = new Interface([
   'event Transfer(address indexed from, address indexed to, uint256 indexed tokenId)',
   'event JourneyUpdated(uint256 indexed tokenId, uint8 status, address indexed handler, uint256 timestamp)',
@@ -25,68 +29,11 @@ const journeyStatus = ['Manufactured', 'Shipped', 'Received', 'Sold']
 const provider = process.env.SEPOLIA_RPC_URL
   ? new JsonRpcProvider(process.env.SEPOLIA_RPC_URL, 11155111)
   : null
-mkdirSync(dirname(databasePath), { recursive: true })
-const db = new DatabaseSync(databasePath)
-
-db.exec(`
-  PRAGMA journal_mode = WAL;
-  CREATE TABLE IF NOT EXISTS assets (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    token_id TEXT,
-    nft_address TEXT,
-    name TEXT NOT NULL,
-    description TEXT NOT NULL DEFAULT '',
-    category TEXT NOT NULL,
-    image TEXT NOT NULL,
-    origin TEXT NOT NULL DEFAULT '',
-    creator TEXT NOT NULL,
-    owner TEXT NOT NULL,
-    price_eth TEXT NOT NULL DEFAULT '',
-    price_wei TEXT NOT NULL DEFAULT '',
-    royalty_bps INTEGER NOT NULL DEFAULT 500,
-    status TEXT NOT NULL DEFAULT 'Draft',
-    is_listed INTEGER NOT NULL DEFAULT 0,
-    is_demo INTEGER NOT NULL DEFAULT 0,
-    token_uri TEXT NOT NULL DEFAULT '',
-    tx_hash TEXT NOT NULL DEFAULT '',
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-  );
-  CREATE UNIQUE INDEX IF NOT EXISTS assets_contract_token
-    ON assets(nft_address, token_id) WHERE token_id IS NOT NULL;
-  CREATE TABLE IF NOT EXISTS transactions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    asset_id INTEGER NOT NULL REFERENCES assets(id),
-    type TEXT NOT NULL,
-    tx_hash TEXT NOT NULL UNIQUE,
-    from_address TEXT NOT NULL,
-    to_address TEXT NOT NULL DEFAULT '',
-    amount_wei TEXT NOT NULL DEFAULT '',
-    created_at TEXT NOT NULL
-  );
-  PRAGMA foreign_keys = ON;
-`)
-
-const count = db.prepare('SELECT COUNT(*) AS count FROM assets').get().count
-if (count === 0) {
-  const now = new Date().toISOString()
-  const insert = db.prepare(`
-    INSERT INTO assets (name, category, image, creator, owner, price_eth, status, is_listed, is_demo, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, 1, 1, ?, ?)
-  `)
-  const samples = [
-    ['Atlas Oak', 'Fashion', 'https://images.unsplash.com/photo-1529139574466-a303027c1d8b?auto=format&fit=crop&w=900&q=85', '0x71C4…8a91', '0x71C4…8a91', '0.085', 'Manufactured'],
-    ['Luna Chronograph', 'Luxury', 'https://images.unsplash.com/photo-1524805444758-089113d48a6d?auto=format&fit=crop&w=900&q=85', '0x8B22…4D70', '0x8B22…4D70', '0.42', 'Shipped'],
-    ['Terra No. 7', 'Collectible', 'https://images.unsplash.com/photo-1618221195710-dd6b41faaea6?auto=format&fit=crop&w=900&q=85', '0x3aF1…19C2', '0x3aF1…19C2', '0.18', 'Received'],
-    ['Studio 54 Chair', 'Design', 'https://images.unsplash.com/photo-1567538096630-e0c55bd6374c?auto=format&fit=crop&w=900&q=85', '0x12D8…77Ee', '0x12D8…77Ee', '0.64', 'Sold'],
-  ]
-  for (const sample of samples) insert.run(...sample, now, now)
-}
 
 const allowedOrigins = (process.env.CORS_ORIGIN || '').split(',').map((origin) => origin.trim()).filter(Boolean)
 app.use((req, res, next) => {
   const origin = req.get('origin')
-  if (origin && (!allowedOrigins.length || allowedOrigins.includes(origin))) {
+  if (origin && allowedOrigins.includes(origin)) {
     res.setHeader('Access-Control-Allow-Origin', origin)
     res.setHeader('Vary', 'Origin')
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS')
@@ -152,11 +99,31 @@ function isImage(value) {
   )
 }
 
-function recordTransaction(assetId, type, txHash, fromAddress, toAddress = '', amountWei = '') {
-  db.prepare(`
-    INSERT INTO transactions (asset_id, type, tx_hash, from_address, to_address, amount_wei, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-  `).run(assetId, type, txHash, fromAddress, toAddress, amountWei, new Date().toISOString())
+function databaseTable(name) {
+  if (!supabase) {
+    const error = new Error('Supabase is not configured on the API server')
+    error.statusCode = 503
+    throw error
+  }
+  return supabase.from(name)
+}
+
+async function queryData(query) {
+  const { data, error } = await query
+  if (error) throw new Error(`Supabase request failed: ${error.message}`)
+  return data
+}
+
+async function recordTransaction(assetId, type, txHash, fromAddress, toAddress = '', amountWei = '') {
+  await queryData(databaseTable('transactions').insert({
+    asset_id: assetId,
+    type,
+    tx_hash: txHash,
+    from_address: fromAddress,
+    to_address: toAddress,
+    amount_wei: amountWei,
+    created_at: new Date().toISOString(),
+  }))
 }
 
 function configuredAddress(...values) {
@@ -207,7 +174,14 @@ async function confirmedEvent({ txHash, contractAddress, eventName, argsMatch, f
   return { transaction, receipt, event }
 }
 
-app.get('/api/health', (_req, res) => res.json({ ok: true, database: 'sqlite' }))
+app.get('/api/health', async (_req, res) => {
+  try {
+    await queryData(databaseTable('assets').select('id').limit(1))
+    res.json({ ok: true, database: 'supabase' })
+  } catch (error) {
+    res.status(error.statusCode || 503).json({ ok: false, database: 'supabase', error: error.message })
+  }
+})
 
 app.get('/api/network', async (_req, res, next) => {
   try {
@@ -238,35 +212,54 @@ app.get('/api/network', async (_req, res, next) => {
   }
 })
 
-app.get('/api/assets', (req, res) => {
-  const owner = typeof req.query.owner === 'string' ? req.query.owner.toLowerCase() : ''
-  const rows = owner
-    ? db.prepare('SELECT * FROM assets WHERE lower(owner) = ? AND is_demo = 0 ORDER BY id DESC').all(owner)
-    : db.prepare('SELECT * FROM assets WHERE is_listed = 1 ORDER BY is_demo DESC, id DESC').all()
-  res.json(rows.map(mapAsset))
+app.get('/api/assets', async (req, res, next) => {
+  try {
+    const owner = typeof req.query.owner === 'string' ? req.query.owner.toLowerCase() : ''
+    if (owner && !isAddress(owner)) return res.status(400).json({ error: 'Invalid owner address' })
+    const query = owner
+      ? databaseTable('assets').select('*').ilike('owner', owner).eq('is_demo', false).order('id', { ascending: false })
+      : databaseTable('assets').select('*').eq('is_listed', true)
+        .order('is_demo', { ascending: false }).order('id', { ascending: false })
+    res.json((await queryData(query)).map(mapAsset))
+  } catch (error) {
+    next(error)
+  }
 })
 
-app.get('/api/assets/:id', (req, res) => {
-  const asset = mapAsset(db.prepare('SELECT * FROM assets WHERE id = ?').get(req.params.id))
-  if (!asset) return res.status(404).json({ error: 'Asset not found' })
-  const transactions = db.prepare('SELECT type, tx_hash, from_address, to_address, amount_wei, created_at FROM transactions WHERE asset_id = ? ORDER BY id ASC').all(req.params.id)
-  res.json({ ...asset, transactions })
+app.get('/api/assets/:id', async (req, res, next) => {
+  try {
+    const row = await queryData(databaseTable('assets').select('*').eq('id', req.params.id).maybeSingle())
+    const asset = mapAsset(row)
+    if (!asset) return res.status(404).json({ error: 'Asset not found' })
+    const transactions = await queryData(databaseTable('transactions')
+      .select('type, tx_hash, from_address, to_address, amount_wei, created_at')
+      .eq('asset_id', req.params.id).order('id', { ascending: true }))
+    res.json({ ...asset, transactions })
+  } catch (error) {
+    next(error)
+  }
 })
 
-app.get('/api/assets/:id/metadata', (req, res) => {
-  const asset = db.prepare('SELECT name, description, image, category FROM assets WHERE id = ?').get(req.params.id)
-  if (!asset) return res.status(404).json({ error: 'Metadata not found' })
-  res.json({
-    name: asset.name,
-    description: asset.description,
-    image: asset.image,
-    attributes: [{ trait_type: 'Category', value: asset.category }],
-  })
+app.get('/api/assets/:id/metadata', async (req, res, next) => {
+  try {
+    const asset = await queryData(databaseTable('assets').select('name, description, image, category')
+      .eq('id', req.params.id).maybeSingle())
+    if (!asset) return res.status(404).json({ error: 'Metadata not found' })
+    res.json({
+      name: asset.name,
+      description: asset.description,
+      image: asset.image,
+      attributes: [{ trait_type: 'Category', value: asset.category }],
+    })
+  } catch (error) {
+    next(error)
+  }
 })
 
 app.get('/api/assets/:id/journey', async (req, res, next) => {
   try {
-    const asset = db.prepare('SELECT * FROM assets WHERE id = ? AND is_demo = 0').get(req.params.id)
+    const asset = await queryData(databaseTable('assets').select('*')
+      .eq('id', req.params.id).eq('is_demo', false).maybeSingle())
     if (!asset || !asset.nft_address || !asset.token_id) return res.status(404).json({ error: 'Minted on-chain asset not found' })
     const chain = requireProvider()
     const network = await chain.getNetwork()
@@ -316,14 +309,25 @@ app.post('/api/assets', async (req, res, next) => {
     }
 
     const now = new Date().toISOString()
-    const result = db.prepare(`
-      INSERT INTO assets (name, description, category, image, origin, creator, owner, royalty_bps, status, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Draft', ?, ?)
-    `).run(name.trim(), description, category.trim(), imageUri, origin, creator, creator, royaltyBps, now, now)
-    const id = Number(result.lastInsertRowid)
-    if (!tokenUri) tokenUri = `${process.env.PUBLIC_API_URL || `http://localhost:${port}`}/api/assets/${id}/metadata`
-    db.prepare('UPDATE assets SET token_uri = ? WHERE id = ?').run(tokenUri, id)
-    res.status(201).json({ id, tokenUri, storage: 'local-sqlite' })
+    const draft = await queryData(databaseTable('assets').insert({
+      name: name.trim(),
+      description,
+      category: category.trim(),
+      image: imageUri,
+      origin,
+      creator,
+      owner: creator,
+      royalty_bps: royaltyBps,
+      status: 'Draft',
+      created_at: now,
+      updated_at: now,
+    }).select('id').single())
+    const id = draft.id
+    const publicApiUrl = process.env.PUBLIC_API_URL
+      || (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : `http://localhost:${port}`)
+    if (!tokenUri) tokenUri = `${publicApiUrl.replace(/\/$/, '')}/api/assets/${id}/metadata`
+    await queryData(databaseTable('assets').update({ token_uri: tokenUri }).eq('id', id))
+    res.status(201).json({ id, tokenUri, storage: 'supabase' })
   } catch (error) {
     next(error)
   }
@@ -335,7 +339,8 @@ app.post('/api/assets/:id/mint', async (req, res, next) => {
   if (!/^\d+$/.test(String(tokenId)) || !isAddress(nftAddress) || !isAddress(creator) || !/^0x[a-fA-F0-9]{64}$/.test(txHash || '')) {
     return res.status(400).json({ error: 'Invalid mint transaction details' })
   }
-  const asset = db.prepare('SELECT * FROM assets WHERE id = ? AND status = ?').get(req.params.id, 'Draft')
+  const asset = await queryData(databaseTable('assets').select('*')
+    .eq('id', req.params.id).eq('status', 'Draft').maybeSingle())
   if (!asset) return res.status(404).json({ error: 'Draft asset not found' })
   if (asset.creator.toLowerCase() !== creator.toLowerCase()) return res.status(403).json({ error: 'Only the creating wallet can confirm this mint' })
   const configuredNft = requireConfiguredAddress(process.env.NFT_CONTRACT_ADDRESS, process.env.VITE_NFT_CONTRACT_ADDRESS)
@@ -350,10 +355,15 @@ app.post('/api/assets/:id/mint', async (req, res, next) => {
       && args.tokenId.toString() === String(tokenId),
   })
   const now = new Date().toISOString()
-  const update = db.prepare('UPDATE assets SET token_id = ?, nft_address = ?, tx_hash = ?, status = ?, updated_at = ? WHERE id = ?')
-  update.run(String(tokenId), nftAddress, txHash, 'Minted', now, req.params.id)
-  recordTransaction(Number(req.params.id), 'Minted', txHash, creator, creator)
-  res.json(mapAsset(db.prepare('SELECT * FROM assets WHERE id = ?').get(req.params.id)))
+  const updated = await queryData(databaseTable('assets').update({
+    token_id: String(tokenId),
+    nft_address: nftAddress,
+    tx_hash: txHash,
+    status: 'Minted',
+    updated_at: now,
+  }).eq('id', req.params.id).select('*').single())
+  await recordTransaction(req.params.id, 'Minted', txHash, creator, creator)
+  res.json(mapAsset(updated))
   } catch (error) {
     next(error)
   }
@@ -365,7 +375,8 @@ app.patch('/api/assets/:id/listing', async (req, res, next) => {
   if (!isAddress(owner) || typeof priceEth !== 'string' || !/^\d+(\.\d{1,18})?$/.test(priceEth) || !/^\d+$/.test(String(priceWei)) || !/^0x[a-fA-F0-9]{64}$/.test(txHash || '')) {
     return res.status(400).json({ error: 'Invalid listing details' })
   }
-  const asset = db.prepare('SELECT * FROM assets WHERE id = ? AND is_demo = 0').get(req.params.id)
+  const asset = await queryData(databaseTable('assets').select('*')
+    .eq('id', req.params.id).eq('is_demo', false).maybeSingle())
   if (!asset || asset.owner.toLowerCase() !== owner.toLowerCase()) return res.status(403).json({ error: 'This wallet does not own the asset' })
   if (!asset.nft_address || !asset.token_id) return res.status(409).json({ error: 'Asset has not been minted on-chain' })
   await confirmedEvent({
@@ -378,10 +389,15 @@ app.patch('/api/assets/:id/listing', async (req, res, next) => {
       && args.seller.toLowerCase() === owner.toLowerCase()
       && args.price.toString() === String(priceWei),
   })
-  db.prepare('UPDATE assets SET price_eth = ?, price_wei = ?, is_listed = 1, status = ?, updated_at = ? WHERE id = ?')
-    .run(priceEth, String(priceWei), 'Listed', new Date().toISOString(), req.params.id)
-  recordTransaction(Number(req.params.id), 'Listed', txHash, owner)
-  res.json(mapAsset(db.prepare('SELECT * FROM assets WHERE id = ?').get(req.params.id)))
+  const updated = await queryData(databaseTable('assets').update({
+    price_eth: priceEth,
+    price_wei: String(priceWei),
+    is_listed: true,
+    status: 'Listed',
+    updated_at: new Date().toISOString(),
+  }).eq('id', req.params.id).select('*').single())
+  await recordTransaction(req.params.id, 'Listed', txHash, owner)
+  res.json(mapAsset(updated))
   } catch (error) {
     next(error)
   }
@@ -391,7 +407,8 @@ app.patch('/api/assets/:id/purchase', async (req, res, next) => {
   try {
   const { buyer, txHash } = req.body
   if (!isAddress(buyer) || !/^0x[a-fA-F0-9]{64}$/.test(txHash || '')) return res.status(400).json({ error: 'Invalid purchase details' })
-  const asset = db.prepare('SELECT * FROM assets WHERE id = ? AND is_listed = 1 AND is_demo = 0').get(req.params.id)
+  const asset = await queryData(databaseTable('assets').select('*')
+    .eq('id', req.params.id).eq('is_listed', true).eq('is_demo', false).maybeSingle())
   if (!asset) return res.status(404).json({ error: 'Active listing not found' })
   if (!asset.nft_address || !asset.token_id || !asset.price_wei) return res.status(409).json({ error: 'Listing is missing on-chain details' })
   await confirmedEvent({
@@ -405,10 +422,14 @@ app.patch('/api/assets/:id/purchase', async (req, res, next) => {
       && args.seller.toLowerCase() === asset.owner.toLowerCase()
       && args.price.toString() === asset.price_wei,
   })
-  db.prepare('UPDATE assets SET owner = ?, is_listed = 0, status = ?, updated_at = ? WHERE id = ?')
-    .run(buyer, 'Sold', new Date().toISOString(), req.params.id)
-  recordTransaction(Number(req.params.id), 'Purchased', txHash, buyer, asset.owner, asset.price_wei)
-  res.json(mapAsset(db.prepare('SELECT * FROM assets WHERE id = ?').get(req.params.id)))
+  const updated = await queryData(databaseTable('assets').update({
+    owner: buyer,
+    is_listed: false,
+    status: 'Sold',
+    updated_at: new Date().toISOString(),
+  }).eq('id', req.params.id).select('*').single())
+  await recordTransaction(req.params.id, 'Purchased', txHash, buyer, asset.owner, asset.price_wei)
+  res.json(mapAsset(updated))
   } catch (error) {
     next(error)
   }
@@ -418,7 +439,8 @@ app.patch('/api/assets/:id/cancel-listing', async (req, res, next) => {
   try {
     const { owner, txHash } = req.body
     if (!isAddress(owner) || !/^0x[a-fA-F0-9]{64}$/.test(txHash || '')) return res.status(400).json({ error: 'Invalid cancellation details' })
-    const asset = db.prepare('SELECT * FROM assets WHERE id = ? AND is_listed = 1 AND is_demo = 0').get(req.params.id)
+    const asset = await queryData(databaseTable('assets').select('*')
+      .eq('id', req.params.id).eq('is_listed', true).eq('is_demo', false).maybeSingle())
     if (!asset || asset.owner.toLowerCase() !== owner.toLowerCase()) return res.status(403).json({ error: 'This wallet does not own the active listing' })
     await confirmedEvent({
       txHash,
@@ -428,10 +450,13 @@ app.patch('/api/assets/:id/cancel-listing', async (req, res, next) => {
       argsMatch: (args) => args.nft.toLowerCase() === asset.nft_address.toLowerCase()
         && args.tokenId.toString() === asset.token_id,
     })
-    db.prepare('UPDATE assets SET is_listed = 0, status = ?, updated_at = ? WHERE id = ?')
-      .run('Minted', new Date().toISOString(), req.params.id)
-    recordTransaction(Number(req.params.id), 'Listing cancelled', txHash, owner)
-    res.json(mapAsset(db.prepare('SELECT * FROM assets WHERE id = ?').get(req.params.id)))
+    const updated = await queryData(databaseTable('assets').update({
+      is_listed: false,
+      status: 'Minted',
+      updated_at: new Date().toISOString(),
+    }).eq('id', req.params.id).select('*').single())
+    await recordTransaction(req.params.id, 'Listing cancelled', txHash, owner)
+    res.json(mapAsset(updated))
   } catch (error) {
     next(error)
   }
@@ -444,7 +469,8 @@ app.patch('/api/assets/:id/price', async (req, res, next) => {
       || !/^\d+$/.test(String(priceWei)) || !/^0x[a-fA-F0-9]{64}$/.test(txHash || '')) {
       return res.status(400).json({ error: 'Invalid price update details' })
     }
-    const asset = db.prepare('SELECT * FROM assets WHERE id = ? AND is_listed = 1 AND is_demo = 0').get(req.params.id)
+    const asset = await queryData(databaseTable('assets').select('*')
+      .eq('id', req.params.id).eq('is_listed', true).eq('is_demo', false).maybeSingle())
     if (!asset || asset.owner.toLowerCase() !== owner.toLowerCase()) return res.status(403).json({ error: 'This wallet does not own the active listing' })
     await confirmedEvent({
       txHash,
@@ -455,21 +481,31 @@ app.patch('/api/assets/:id/price', async (req, res, next) => {
         && args.tokenId.toString() === asset.token_id
         && args.price.toString() === String(priceWei),
     })
-    db.prepare('UPDATE assets SET price_eth = ?, price_wei = ?, updated_at = ? WHERE id = ?')
-      .run(priceEth, String(priceWei), new Date().toISOString(), req.params.id)
-    recordTransaction(Number(req.params.id), 'Price updated', txHash, owner)
-    res.json(mapAsset(db.prepare('SELECT * FROM assets WHERE id = ?').get(req.params.id)))
+    const updated = await queryData(databaseTable('assets').update({
+      price_eth: priceEth,
+      price_wei: String(priceWei),
+      updated_at: new Date().toISOString(),
+    }).eq('id', req.params.id).select('*').single())
+    await recordTransaction(req.params.id, 'Price updated', txHash, owner)
+    res.json(mapAsset(updated))
   } catch (error) {
     next(error)
   }
 })
 
-app.delete('/api/assets/:id', (req, res) => {
-  const asset = db.prepare('SELECT * FROM assets WHERE id = ? AND status = ?').get(req.params.id, 'Draft')
-  if (!asset) return res.status(404).json({ error: 'Draft asset not found' })
-  if (String(req.query.creator || '').toLowerCase() !== asset.creator.toLowerCase()) return res.status(403).json({ error: 'Only the creating wallet can remove this draft' })
-  db.prepare('DELETE FROM assets WHERE id = ?').run(req.params.id)
-  res.status(204).end()
+app.delete('/api/assets/:id', async (req, res, next) => {
+  try {
+    const asset = await queryData(databaseTable('assets').select('*')
+      .eq('id', req.params.id).eq('status', 'Draft').maybeSingle())
+    if (!asset) return res.status(404).json({ error: 'Draft asset not found' })
+    if (String(req.query.creator || '').toLowerCase() !== asset.creator.toLowerCase()) {
+      return res.status(403).json({ error: 'Only the creating wallet can remove this draft' })
+    }
+    await queryData(databaseTable('assets').delete().eq('id', req.params.id))
+    res.status(204).end()
+  } catch (error) {
+    next(error)
+  }
 })
 
 app.use((error, _req, res, _next) => {
@@ -477,4 +513,8 @@ app.use((error, _req, res, _next) => {
   res.status(error.statusCode || 500).json({ error: error.statusCode ? error.message : 'Database request failed' })
 })
 
-app.listen(port, () => console.log(`Atlas API listening on http://localhost:${port} (${databasePath})`))
+if (!process.env.VERCEL && process.env.NODE_ENV !== 'test') {
+  app.listen(port, () => console.log(`Atlas API listening on http://localhost:${port}`))
+}
+
+export default app
