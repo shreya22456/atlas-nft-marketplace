@@ -16,6 +16,8 @@ services:
         value: /var/data/atlas.sqlite
       - key: PUBLIC_API_URL
         sync: false
+      - key: SEPOLIA_RPC_URL
+        sync: false
       - key: CORS_ORIGIN
         sync: false
       - key: PINATA_JWT
@@ -23,4 +25,8 @@ services:
       - key: VITE_NFT_CONTRACT_ADDRESS
         sync: false
       - key: VITE_MARKETPLACE_CONTRACT_ADDRESS
+        sync: false
+      - key: NFT_CONTRACT_ADDRESS
+        sync: false
+      - key: MARKETPLACE_CONTRACT_ADDRESS
         sync: false

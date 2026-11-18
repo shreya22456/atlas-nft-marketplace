@@ -22,11 +22,11 @@ The frontend runs at `http://localhost:5173` and the API at `http://localhost:30
 ## Configure MetaMask and Sepolia
 
 1. Copy `.env.example` to `.env.local`.
-2. Deploy the contracts and set `VITE_NFT_CONTRACT_ADDRESS` and `VITE_MARKETPLACE_CONTRACT_ADDRESS`.
-3. Configure `SEPOLIA_RPC_URL` and `PRIVATE_KEY` for deployment.
+2. Set `SEPOLIA_RPC_URL` and `PRIVATE_KEY` locally, then run `npm run deploy:sepolia`. The script checks the chain ID and prints both contract addresses and Sepolia Etherscan links.
+3. Set both `VITE_*_CONTRACT_ADDRESS` values in `.env.local`, and the non-prefixed contract address variables plus `SEPOLIA_RPC_URL` on the API host.
 4. Restart the dev server after changing environment variables.
 
-Install MetaMask and connect it to Sepolia. Minting, listing, and purchases require deployed contract addresses and Sepolia test ETH. Set `PINATA_JWT` in `.env.local` to pin uploaded images and metadata to IPFS; without it, metadata is served from the local API.
+Install MetaMask and connect it to Sepolia. Minting, listing, price updates, listing cancellation, product journey updates, and purchases require deployed contract addresses and Sepolia test ETH. The API checks confirmed Sepolia receipts and contract events before syncing them into SQLite. `GET /api/network` reports RPC and deployment status. Set `PINATA_JWT` in `.env.local` to pin uploaded images and metadata to IPFS; without it, metadata is served from the local API.
 
 ## Compile, test, and deploy
 

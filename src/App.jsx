@@ -38,6 +38,7 @@ function App() {
   const [account, setAccount] = useState('')
   const [notice, setNotice] = useState('')
   const [busy, setBusy] = useState(false)
+  const [network, setNetwork] = useState(null)
 
   const fetchAssets = useCallback(async (owner = '') => {
     const query = owner ? `?owner=${encodeURIComponent(owner)}` : ''
@@ -47,6 +48,7 @@ function App() {
 
   useEffect(() => {
     fetchAssets().then(setAssets).catch((error) => setNotice(`Database unavailable: ${errorMessage(error)}`))
+    api('/network').then(setNetwork).catch((error) => setNotice(`Network API unavailable: ${errorMessage(error)}`))
     const ethereum = window.ethereum
     if (!ethereum) return undefined
 
@@ -122,9 +124,113 @@ function App() {
 
   async function openAsset(asset) {
     try {
-      setSelected(await api(`/assets/${asset.id}`))
+      const detail = await api(`/assets/${asset.id}`)
+      if (!detail.is_demo && detail.token_id) {
+        try {
+          detail.journey = await api(`/assets/${asset.id}/journey`)
+        } catch (error) {
+          detail.journeyError = errorMessage(error)
+        }
+      }
+      setSelected(detail)
     } catch (error) {
       setNotice(`Could not load asset: ${errorMessage(error)}`)
+    }
+  }
+
+  async function syncTransaction(path, body, owner) {
+    try {
+      await api(path, { method: 'PATCH', body: JSON.stringify(body) })
+      await loadAssets(owner)
+      const refreshed = await api(`/assets/${selected.id}`)
+      try { refreshed.journey = await api(`/assets/${selected.id}/journey`) } catch (error) { refreshed.journeyError = errorMessage(error) }
+      setSelected(refreshed)
+    } catch (error) {
+      throw new Error(`Transaction confirmed, but API sync failed: ${errorMessage(error)}`)
+    }
+  }
+
+  async function updateListingPrice(asset) {
+    const price = window.prompt('Enter the new sale price in Sepolia ETH')
+    if (price === null) return
+    setBusy(true)
+    try {
+      if (!marketplaceAddress) throw new Error('Set VITE_MARKETPLACE_CONTRACT_ADDRESS after deploying the marketplace.')
+      const priceWei = parseEther(price.trim())
+      if (priceWei <= 0n) throw new Error('Price must be greater than zero')
+      const signer = await getSepoliaSigner()
+      const owner = await signer.getAddress()
+      const marketplace = new Contract(marketplaceAddress, MARKETPLACE_ABI, signer)
+      setNotice('Confirm price update in your wallet…')
+      const tx = await marketplace.updatePrice(asset.nft_address, asset.token_id, priceWei)
+      await tx.wait()
+      await syncTransaction(`/assets/${asset.id}/price`, {
+        owner,
+        priceEth: price.trim(),
+        priceWei: priceWei.toString(),
+        txHash: tx.hash,
+      }, owner)
+      setNotice('Listing price updated')
+    } catch (error) {
+      setNotice(errorMessage(error))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function cancelListing(asset) {
+    setBusy(true)
+    try {
+      if (!marketplaceAddress) throw new Error('Set VITE_MARKETPLACE_CONTRACT_ADDRESS after deploying the marketplace.')
+      const signer = await getSepoliaSigner()
+      const owner = await signer.getAddress()
+      const marketplace = new Contract(marketplaceAddress, MARKETPLACE_ABI, signer)
+      setNotice('Confirm cancellation in your wallet…')
+      const tx = await marketplace.cancelListing(asset.nft_address, asset.token_id)
+      await tx.wait()
+      await syncTransaction(`/assets/${asset.id}/cancel-listing`, { owner, txHash: tx.hash }, owner)
+      setNotice('Listing cancelled')
+    } catch (error) {
+      setNotice(errorMessage(error))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function updateJourney(asset) {
+    const labels = ['Manufactured', 'Shipped', 'Received', 'Sold']
+    const currentIndex = (asset.journey || []).length
+      ? labels.indexOf(asset.journey[asset.journey.length - 1].status)
+      : -1
+    const availableStatuses = labels.slice(Math.max(currentIndex + 1, 0))
+    if (!availableStatuses.length) {
+      setNotice('The product journey is already complete')
+      return
+    }
+    const choice = window.prompt(`Choose next status: ${availableStatuses.join(', ')}`)
+    if (!choice) return
+    const status = labels.indexOf(choice.trim())
+    if (status < 0 || !availableStatuses.includes(labels[status])) {
+      setNotice(`Choose one of: ${availableStatuses.join(', ')}`)
+      return
+    }
+    const location = window.prompt('Enter the product location')
+    if (location === null) return
+    setBusy(true)
+    try {
+      const signer = await getSepoliaSigner()
+      const nft = new Contract(asset.nft_address, NFT_ABI, signer)
+      setNotice('Confirm supply-chain update in your wallet…')
+      const tx = await nft.updateJourney(asset.token_id, status, location)
+      await tx.wait()
+      const detail = await api(`/assets/${asset.id}`)
+      detail.journey = await api(`/assets/${asset.id}/journey`)
+      setSelected(detail)
+      setNotice('Supply-chain event recorded on Sepolia')
+    } catch (error) {
+      setNotice(errorMessage(error))
+    } finally {
+      setBusy(false)
     }
   }
 
@@ -275,8 +381,33 @@ function App() {
               <div className="attributes"><div><span>Origin</span><b>{selected.origin || 'Not recorded'}</b></div><div><span>Royalty</span><b>{(selected.royalty_bps / 100).toFixed(2)}%</b></div><div><span>Chain</span><b>{selected.is_demo ? 'Preview' : chainLabel}</b></div></div>
             </div>
           </section>
+          {!selected.is_demo && account.toLowerCase() === selected.owner.toLowerCase() && (
+            <section className="asset-actions">
+              {!selected.is_listed && <button className="mint-button" disabled={busy} onClick={() => listAsset(selected)}>List for sale</button>}
+              {selected.is_listed && <>
+                <button className="mint-button" disabled={busy} onClick={() => updateListingPrice(selected)}>Update price</button>
+                <button className="filter" disabled={busy} onClick={() => cancelListing(selected)}>Cancel listing</button>
+              </>}
+              <button className="filter" disabled={busy} onClick={() => updateJourney(selected)}>Update product journey</button>
+            </section>
+          )}
           <section className="provenance">
-            <div className="section-heading"><div><p className="eyebrow">Transaction record</p><h2>Asset history</h2></div><span className="live"><i /> {selected.is_demo ? 'Sample data' : 'Sepolia'}</span></div>
+            <div className="section-heading"><div><p className="eyebrow">On-chain supply-chain record</p><h2>Product journey</h2></div><span className="live"><i /> {selected.is_demo ? 'Sample data' : 'Sepolia'}</span></div>
+            {selected.journeyError && <p className="history-empty">Could not load the on-chain journey: {selected.journeyError}</p>}
+            <div className="timeline">
+              {(selected.journey || []).map((entry, index) => (
+                <div className="timeline-item" key={`${entry.timestamp}-${index}`}>
+                  <div className={`timeline-node ${index === selected.journey.length - 1 ? 'latest' : ''}`}><span>{index + 1}</span></div>
+                  <div><b>{entry.status}</b><p>{entry.location || 'Location not recorded'} · {shortAddress(entry.handler)}</p></div>
+                  <time>{new Date(entry.timestamp * 1000).toLocaleString()}</time>
+                </div>
+              ))}
+              {selected.is_demo && !(selected.journey || []).length && <div className="timeline-item"><div className="timeline-node"><span>1</span></div><div><b>{selected.status}</b><p>Sample listing · not verified on-chain</p></div><time>Preview</time></div>}
+              {!selected.is_demo && !selected.journeyError && !(selected.journey || []).length && <p className="history-empty">No supply-chain events are recorded yet.</p>}
+            </div>
+          </section>
+          <section className="provenance">
+            <div className="section-heading"><div><p className="eyebrow">Confirmed transactions</p><h2>Transaction history</h2></div><span className="live"><i /> {selected.is_demo ? 'Preview' : 'Sepolia'}</span></div>
             <div className="timeline">
               {(selected.transactions || []).length ? selected.transactions.map((transaction, index) => (
                 <div className="timeline-item" key={transaction.tx_hash}>
@@ -284,9 +415,7 @@ function App() {
                   <div><b>{transaction.type}</b><p>{shortAddress(transaction.from_address)}{transaction.to_address ? ` → ${shortAddress(transaction.to_address)}` : ''}</p></div>
                   <time>{new Date(transaction.created_at).toLocaleString()}</time>
                 </div>
-              )) : selected.is_demo
-                ? <div className="timeline-item"><div className="timeline-node"><span>1</span></div><div><b>{selected.status}</b><p>Sample listing · not verified on-chain</p></div><time>Preview</time></div>
-                : <p className="history-empty">No confirmed transactions have been recorded yet.</p>}
+              )) : <p className="history-empty">No confirmed transactions have been recorded yet.</p>}
             </div>
           </section>
         </main>
@@ -299,7 +428,7 @@ function App() {
                 <div className="hero-art"><img src="https://images.unsplash.com/photo-1597047084897-51e81819a499?auto=format&fit=crop&w=1000&q=90" alt="Sculptural chair" /><div className="hero-card"><span>Featured drop</span><b>Monolith Chair</b><strong>0.72 ETH</strong></div></div>
               </section>
               <section className="catalog">
-                <div className="section-heading"><div><p className="eyebrow">Curated works</p><h2>Marketplace</h2></div><button className="filter">Sepolia · All assets⌄</button></div>
+                <div className="section-heading"><div><p className="eyebrow">Curated works</p><h2>Marketplace</h2></div><button className="filter">{network?.connected ? `Sepolia · Block ${network.blockNumber}` : 'Sepolia · RPC not configured'} ⌄</button></div>
                 <div className="product-grid">
                   {assets.map((asset) => <article className="product-card" key={asset.id} onClick={() => openAsset(asset)}>
                     <div className="product-image"><img src={asset.image} alt={asset.name} /><span>{asset.is_demo ? 'Sample' : asset.status}</span></div>

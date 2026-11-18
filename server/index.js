@@ -3,6 +3,7 @@ import express from 'express'
 import { DatabaseSync } from 'node:sqlite'
 import { mkdirSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
+import { Contract, Interface, JsonRpcProvider, getAddress } from 'ethers'
 
 dotenv.config({ path: '.env' })
 dotenv.config({ path: '.env.local' })
@@ -10,6 +11,20 @@ dotenv.config({ path: '.env.local' })
 const app = express()
 const port = Number(process.env.PORT || process.env.API_PORT || 3001)
 const databasePath = resolve(process.env.DATABASE_PATH || 'data/atlas.sqlite')
+const nftInterface = new Interface([
+  'event Transfer(address indexed from, address indexed to, uint256 indexed tokenId)',
+  'event JourneyUpdated(uint256 indexed tokenId, uint8 status, address indexed handler, uint256 timestamp)',
+])
+const marketplaceInterface = new Interface([
+  'event Listed(address indexed nft, uint256 indexed tokenId, address indexed seller, uint256 price)',
+  'event ListingCancelled(address indexed nft, uint256 indexed tokenId)',
+  'event PriceUpdated(address indexed nft, uint256 indexed tokenId, uint256 price)',
+  'event Purchased(address indexed nft, uint256 indexed tokenId, address indexed buyer, address seller, uint256 price)',
+])
+const journeyStatus = ['Manufactured', 'Shipped', 'Received', 'Sold']
+const provider = process.env.SEPOLIA_RPC_URL
+  ? new JsonRpcProvider(process.env.SEPOLIA_RPC_URL, 11155111)
+  : null
 mkdirSync(dirname(databasePath), { recursive: true })
 const db = new DatabaseSync(databasePath)
 
@@ -144,7 +159,84 @@ function recordTransaction(assetId, type, txHash, fromAddress, toAddress = '', a
   `).run(assetId, type, txHash, fromAddress, toAddress, amountWei, new Date().toISOString())
 }
 
+function configuredAddress(...values) {
+  const address = values.find(Boolean)
+  return address && isAddress(address) ? getAddress(address) : ''
+}
+
+function requireConfiguredAddress(...values) {
+  const address = configuredAddress(...values)
+  if (!address) {
+    const error = new Error('The required deployed contract address is not configured on the API server')
+    error.statusCode = 503
+    throw error
+  }
+  return address
+}
+
+function requireProvider() {
+  if (!provider) {
+    const error = new Error('SEPOLIA_RPC_URL is not configured on the API server')
+    error.statusCode = 503
+    throw error
+  }
+  return provider
+}
+
+async function confirmedEvent({ txHash, contractAddress, eventName, argsMatch, fromAddress }) {
+  const chain = requireProvider()
+  const [network, transaction, receipt] = await Promise.all([
+    chain.getNetwork(),
+    chain.getTransaction(txHash),
+    chain.getTransactionReceipt(txHash),
+  ])
+  if (Number(network.chainId) !== 11155111) throw new Error('API RPC is not connected to Sepolia')
+  if (!transaction || !receipt || receipt.status !== 1) throw new Error('Transaction is missing or not confirmed successfully')
+  if (transaction.to?.toLowerCase() !== contractAddress.toLowerCase()) throw new Error('Transaction targets a different contract')
+  if (fromAddress && transaction.from.toLowerCase() !== fromAddress.toLowerCase()) throw new Error('Transaction sender does not match the connected wallet')
+  const iface = eventName === 'Listed' || eventName === 'ListingCancelled' || eventName === 'PriceUpdated' || eventName === 'Purchased'
+    ? marketplaceInterface
+    : nftInterface
+  const event = receipt.logs
+    .filter((log) => log.address.toLowerCase() === contractAddress.toLowerCase())
+    .map((log) => {
+      try { return iface.parseLog(log) } catch { return null }
+    })
+    .find((log) => log?.name === eventName && argsMatch(log.args))
+  if (!event) throw new Error(`Confirmed transaction does not contain the expected ${eventName} event`)
+  return { transaction, receipt, event }
+}
+
 app.get('/api/health', (_req, res) => res.json({ ok: true, database: 'sqlite' }))
+
+app.get('/api/network', async (_req, res, next) => {
+  try {
+    const nft = configuredAddress(process.env.NFT_CONTRACT_ADDRESS, process.env.VITE_NFT_CONTRACT_ADDRESS)
+    const marketplace = configuredAddress(process.env.MARKETPLACE_CONTRACT_ADDRESS, process.env.VITE_MARKETPLACE_CONTRACT_ADDRESS)
+    if (!provider) {
+      return res.json({ chainId: 11155111, name: 'Sepolia', connected: false, nftAddress: nft || null, marketplaceAddress: marketplace || null })
+    }
+    const [network, blockNumber, nftCode, marketplaceCode] = await Promise.all([
+      provider.getNetwork(),
+      provider.getBlockNumber(),
+      nft ? provider.getCode(nft) : '0x',
+      marketplace ? provider.getCode(marketplace) : '0x',
+    ])
+    if (Number(network.chainId) !== 11155111) throw new Error('API RPC is not connected to Sepolia')
+    res.json({
+      chainId: Number(network.chainId),
+      name: 'Sepolia',
+      connected: true,
+      blockNumber,
+      nftAddress: nft || null,
+      nftDeployed: Boolean(nft && nftCode !== '0x'),
+      marketplaceAddress: marketplace || null,
+      marketplaceDeployed: Boolean(marketplace && marketplaceCode !== '0x'),
+    })
+  } catch (error) {
+    next(error)
+  }
+})
 
 app.get('/api/assets', (req, res) => {
   const owner = typeof req.query.owner === 'string' ? req.query.owner.toLowerCase() : ''
@@ -170,6 +262,31 @@ app.get('/api/assets/:id/metadata', (req, res) => {
     image: asset.image,
     attributes: [{ trait_type: 'Category', value: asset.category }],
   })
+})
+
+app.get('/api/assets/:id/journey', async (req, res, next) => {
+  try {
+    const asset = db.prepare('SELECT * FROM assets WHERE id = ? AND is_demo = 0').get(req.params.id)
+    if (!asset || !asset.nft_address || !asset.token_id) return res.status(404).json({ error: 'Minted on-chain asset not found' })
+    const chain = requireProvider()
+    const network = await chain.getNetwork()
+    if (Number(network.chainId) !== 11155111) throw new Error('API RPC is not connected to Sepolia')
+    const nft = new Contract(asset.nft_address, [
+      'function journeyCount(uint256 tokenId) view returns (uint256)',
+      'function journey(uint256 tokenId, uint256 index) view returns (uint8 status, address handler, uint256 timestamp, string location)',
+    ], chain)
+    const count = Number(await nft.journeyCount(asset.token_id))
+    const entries = await Promise.all(Array.from({ length: count }, (_, index) => nft.journey(asset.token_id, index)))
+    res.json(entries.map((entry, index) => ({
+      index,
+      status: journeyStatus[Number(entry.status)] || 'Unknown',
+      handler: entry.handler,
+      timestamp: Number(entry.timestamp),
+      location: entry.location,
+    })))
+  } catch (error) {
+    next(error)
+  }
 })
 
 app.post('/api/assets', async (req, res, next) => {
@@ -212,7 +329,8 @@ app.post('/api/assets', async (req, res, next) => {
   }
 })
 
-app.post('/api/assets/:id/mint', (req, res) => {
+app.post('/api/assets/:id/mint', async (req, res, next) => {
+  try {
   const { tokenId, nftAddress, txHash, creator } = req.body
   if (!/^\d+$/.test(String(tokenId)) || !isAddress(nftAddress) || !isAddress(creator) || !/^0x[a-fA-F0-9]{64}$/.test(txHash || '')) {
     return res.status(400).json({ error: 'Invalid mint transaction details' })
@@ -220,35 +338,130 @@ app.post('/api/assets/:id/mint', (req, res) => {
   const asset = db.prepare('SELECT * FROM assets WHERE id = ? AND status = ?').get(req.params.id, 'Draft')
   if (!asset) return res.status(404).json({ error: 'Draft asset not found' })
   if (asset.creator.toLowerCase() !== creator.toLowerCase()) return res.status(403).json({ error: 'Only the creating wallet can confirm this mint' })
+  const configuredNft = requireConfiguredAddress(process.env.NFT_CONTRACT_ADDRESS, process.env.VITE_NFT_CONTRACT_ADDRESS)
+  if (getAddress(nftAddress) !== configuredNft) return res.status(400).json({ error: 'NFT contract does not match the configured Sepolia contract' })
+  await confirmedEvent({
+    txHash,
+    contractAddress: getAddress(nftAddress),
+    eventName: 'Transfer',
+    fromAddress: creator,
+    argsMatch: (args) => args.from === '0x0000000000000000000000000000000000000000'
+      && args.to.toLowerCase() === creator.toLowerCase()
+      && args.tokenId.toString() === String(tokenId),
+  })
   const now = new Date().toISOString()
   const update = db.prepare('UPDATE assets SET token_id = ?, nft_address = ?, tx_hash = ?, status = ?, updated_at = ? WHERE id = ?')
   update.run(String(tokenId), nftAddress, txHash, 'Minted', now, req.params.id)
   recordTransaction(Number(req.params.id), 'Minted', txHash, creator, creator)
   res.json(mapAsset(db.prepare('SELECT * FROM assets WHERE id = ?').get(req.params.id)))
+  } catch (error) {
+    next(error)
+  }
 })
 
-app.patch('/api/assets/:id/listing', (req, res) => {
+app.patch('/api/assets/:id/listing', async (req, res, next) => {
+  try {
   const { owner, priceEth, priceWei, txHash } = req.body
   if (!isAddress(owner) || typeof priceEth !== 'string' || !/^\d+(\.\d{1,18})?$/.test(priceEth) || !/^\d+$/.test(String(priceWei)) || !/^0x[a-fA-F0-9]{64}$/.test(txHash || '')) {
     return res.status(400).json({ error: 'Invalid listing details' })
   }
   const asset = db.prepare('SELECT * FROM assets WHERE id = ? AND is_demo = 0').get(req.params.id)
   if (!asset || asset.owner.toLowerCase() !== owner.toLowerCase()) return res.status(403).json({ error: 'This wallet does not own the asset' })
+  if (!asset.nft_address || !asset.token_id) return res.status(409).json({ error: 'Asset has not been minted on-chain' })
+  await confirmedEvent({
+    txHash,
+    contractAddress: requireConfiguredAddress(process.env.MARKETPLACE_CONTRACT_ADDRESS, process.env.VITE_MARKETPLACE_CONTRACT_ADDRESS),
+    eventName: 'Listed',
+    fromAddress: owner,
+    argsMatch: (args) => args.nft.toLowerCase() === asset.nft_address.toLowerCase()
+      && args.tokenId.toString() === asset.token_id
+      && args.seller.toLowerCase() === owner.toLowerCase()
+      && args.price.toString() === String(priceWei),
+  })
   db.prepare('UPDATE assets SET price_eth = ?, price_wei = ?, is_listed = 1, status = ?, updated_at = ? WHERE id = ?')
     .run(priceEth, String(priceWei), 'Listed', new Date().toISOString(), req.params.id)
   recordTransaction(Number(req.params.id), 'Listed', txHash, owner)
   res.json(mapAsset(db.prepare('SELECT * FROM assets WHERE id = ?').get(req.params.id)))
+  } catch (error) {
+    next(error)
+  }
 })
 
-app.patch('/api/assets/:id/purchase', (req, res) => {
+app.patch('/api/assets/:id/purchase', async (req, res, next) => {
+  try {
   const { buyer, txHash } = req.body
   if (!isAddress(buyer) || !/^0x[a-fA-F0-9]{64}$/.test(txHash || '')) return res.status(400).json({ error: 'Invalid purchase details' })
   const asset = db.prepare('SELECT * FROM assets WHERE id = ? AND is_listed = 1 AND is_demo = 0').get(req.params.id)
   if (!asset) return res.status(404).json({ error: 'Active listing not found' })
+  if (!asset.nft_address || !asset.token_id || !asset.price_wei) return res.status(409).json({ error: 'Listing is missing on-chain details' })
+  await confirmedEvent({
+    txHash,
+    contractAddress: requireConfiguredAddress(process.env.MARKETPLACE_CONTRACT_ADDRESS, process.env.VITE_MARKETPLACE_CONTRACT_ADDRESS),
+    eventName: 'Purchased',
+    fromAddress: buyer,
+    argsMatch: (args) => args.nft.toLowerCase() === asset.nft_address.toLowerCase()
+      && args.tokenId.toString() === asset.token_id
+      && args.buyer.toLowerCase() === buyer.toLowerCase()
+      && args.seller.toLowerCase() === asset.owner.toLowerCase()
+      && args.price.toString() === asset.price_wei,
+  })
   db.prepare('UPDATE assets SET owner = ?, is_listed = 0, status = ?, updated_at = ? WHERE id = ?')
     .run(buyer, 'Sold', new Date().toISOString(), req.params.id)
   recordTransaction(Number(req.params.id), 'Purchased', txHash, buyer, asset.owner, asset.price_wei)
   res.json(mapAsset(db.prepare('SELECT * FROM assets WHERE id = ?').get(req.params.id)))
+  } catch (error) {
+    next(error)
+  }
+})
+
+app.patch('/api/assets/:id/cancel-listing', async (req, res, next) => {
+  try {
+    const { owner, txHash } = req.body
+    if (!isAddress(owner) || !/^0x[a-fA-F0-9]{64}$/.test(txHash || '')) return res.status(400).json({ error: 'Invalid cancellation details' })
+    const asset = db.prepare('SELECT * FROM assets WHERE id = ? AND is_listed = 1 AND is_demo = 0').get(req.params.id)
+    if (!asset || asset.owner.toLowerCase() !== owner.toLowerCase()) return res.status(403).json({ error: 'This wallet does not own the active listing' })
+    await confirmedEvent({
+      txHash,
+      contractAddress: requireConfiguredAddress(process.env.MARKETPLACE_CONTRACT_ADDRESS, process.env.VITE_MARKETPLACE_CONTRACT_ADDRESS),
+      eventName: 'ListingCancelled',
+      fromAddress: owner,
+      argsMatch: (args) => args.nft.toLowerCase() === asset.nft_address.toLowerCase()
+        && args.tokenId.toString() === asset.token_id,
+    })
+    db.prepare('UPDATE assets SET is_listed = 0, status = ?, updated_at = ? WHERE id = ?')
+      .run('Minted', new Date().toISOString(), req.params.id)
+    recordTransaction(Number(req.params.id), 'Listing cancelled', txHash, owner)
+    res.json(mapAsset(db.prepare('SELECT * FROM assets WHERE id = ?').get(req.params.id)))
+  } catch (error) {
+    next(error)
+  }
+})
+
+app.patch('/api/assets/:id/price', async (req, res, next) => {
+  try {
+    const { owner, priceEth, priceWei, txHash } = req.body
+    if (!isAddress(owner) || typeof priceEth !== 'string' || !/^\d+(\.\d{1,18})?$/.test(priceEth)
+      || !/^\d+$/.test(String(priceWei)) || !/^0x[a-fA-F0-9]{64}$/.test(txHash || '')) {
+      return res.status(400).json({ error: 'Invalid price update details' })
+    }
+    const asset = db.prepare('SELECT * FROM assets WHERE id = ? AND is_listed = 1 AND is_demo = 0').get(req.params.id)
+    if (!asset || asset.owner.toLowerCase() !== owner.toLowerCase()) return res.status(403).json({ error: 'This wallet does not own the active listing' })
+    await confirmedEvent({
+      txHash,
+      contractAddress: requireConfiguredAddress(process.env.MARKETPLACE_CONTRACT_ADDRESS, process.env.VITE_MARKETPLACE_CONTRACT_ADDRESS),
+      eventName: 'PriceUpdated',
+      fromAddress: owner,
+      argsMatch: (args) => args.nft.toLowerCase() === asset.nft_address.toLowerCase()
+        && args.tokenId.toString() === asset.token_id
+        && args.price.toString() === String(priceWei),
+    })
+    db.prepare('UPDATE assets SET price_eth = ?, price_wei = ?, updated_at = ? WHERE id = ?')
+      .run(priceEth, String(priceWei), new Date().toISOString(), req.params.id)
+    recordTransaction(Number(req.params.id), 'Price updated', txHash, owner)
+    res.json(mapAsset(db.prepare('SELECT * FROM assets WHERE id = ?').get(req.params.id)))
+  } catch (error) {
+    next(error)
+  }
 })
 
 app.delete('/api/assets/:id', (req, res) => {

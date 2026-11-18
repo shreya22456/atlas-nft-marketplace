@@ -11,7 +11,8 @@
     "lint": "oxlint",
     "preview": "vite preview",
     "compile": "hardhat compile",
-    "test": "hardhat test"
+    "test": "hardhat test",
+    "deploy:sepolia": "hardhat run scripts/deploy.cjs --network sepolia"
   },
   "dependencies": {
     "ethers": "^6.15.0",
